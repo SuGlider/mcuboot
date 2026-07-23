@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     branches:
       - main
-  pull_request:
+#  pull_request:
 #  schedule:
 #    - cron: 42 3 * * *
 
