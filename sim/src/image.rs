@@ -50,7 +50,7 @@ use crate::depends::{
     PairDep,
     UpgradeInfo,
 };
-use crate::tlv::{ManifestGen, TlvGen, TlvFlags};
+use crate::tlv::{ManifestGen, SigningKey, TlvGen, TlvFlags};
 use crate::utils::align_up;
 use typenum::{U32, U16};
 
@@ -140,9 +140,42 @@ impl ImagesBuilder {
     pub fn new(device: DeviceName, align: usize, erased_val: u8) -> Result<Self, String> {
         let (flash, areadesc, unsupported_caps) = Self::make_device(device, align, erased_val);
 
+        // Swap-move and swap-offset require uniformly sized erase units, which
+        // is why devices with varying page sizes list them as unsupported.
+        // Logical sectors give the bootloader exactly that, so on a device
+        // whose physical pages are *not* already the logical sector size, the
+        // restriction no longer applies.  Devices whose pages natively match
+        // keep their exclusions: theirs have some other cause (K64fBig's
+        // single slot-sized sector, Nrf52840UnequalSlots' slot sizes).
+        let logical = c::logical_sector_size();
+        let scratch = Caps::SwapUsingScratch.present();
+        let logical_makes_uniform = logical != 0
+            && areadesc.supports_logical_sector_size(logical, scratch)
+            && !areadesc.uses_native_sector_size(logical, scratch);
+
         for cap in unsupported_caps {
-            if cap.present() {
+            if !cap.present() {
+                continue;
+            }
+            let relaxed = logical_makes_uniform
+                && matches!(cap, Caps::SwapUsingMove | Caps::SwapUsingOffset);
+            if !relaxed {
                 return Err(format!("unsupported {:?}", cap));
+            }
+        }
+
+        // Those algorithms spend one logical sector on the trailer and one on
+        // the swap padding, so a slot of two sectors or fewer has no room left
+        // for an image.
+        if logical != 0 && (Caps::SwapUsingMove.present() || Caps::SwapUsingOffset.present()) {
+            let slot = if Caps::SwapUsingOffset.present() {
+                FlashId::Image1
+            } else {
+                FlashId::Image0
+            };
+            if areadesc.find(slot).map(|(_, len, _)| len).unwrap_or(0) <= 2 * logical {
+                return Err("slot too small for logical-sector swap padding and trailer"
+                           .to_string());
             }
         }
 
@@ -204,12 +237,66 @@ impl ImagesBuilder {
         })
     }
 
+    /// Whether the sector layout this device reports to the bootloader is
+    /// compatible with the logical sector size the simulator was built with.
+    /// Every logical sector boundary must fall on a reported erase page
+    /// boundary; the answer is derived from the area description rather than
+    /// a list of device names, so it stays correct as devices are added.
+    /// The scratch area only counts when the build actually uses it, matching
+    /// what `boot_read_sectors()` verifies.  Always true when logical sectors
+    /// are disabled.
+    pub fn device_supports_logical_sectors(device: DeviceName, align: usize,
+                                           erased_val: u8) -> bool {
+        let size = c::logical_sector_size();
+        if size == 0 {
+            return true;
+        }
+        let (_, areadesc, _) = Self::make_device(device, align, erased_val);
+        areadesc.supports_logical_sector_size(size, Caps::SwapUsingScratch.present())
+    }
+
+    fn device_usable(dev: DeviceName, align: usize, erased_val: u8) -> Result<(), String> {
+        if c::logical_sector_size() != 0 {
+            if !Self::device_supports_logical_sectors(dev, align, erased_val) {
+                return Err("sector layout incompatible with logical sectors".to_string());
+            }
+        } else if matches!(dev, DeviceName::SmallPages) {
+            return Err("slots have more pages than BOOT_MAX_IMG_SECTORS; \
+                        requires logical sectors".to_string());
+        }
+        Ok(())
+    }
+
     pub fn each_device<F>(f: F)
         where F: Fn(Self)
     {
         for &dev in ALL_DEVICES {
             for &align in test_alignments() {
                 for &erased_val in &[0, 0xff] {
+                    match Self::device_usable(dev, align, erased_val)
+                            .and_then(|()| Self::new(dev, align, erased_val)) {
+                        Ok(run) => f(run),
+                        Err(msg) => warn!("Skipping {}: {}", dev, msg),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Iterate the devices excluded from `each_device` by the configured
+    /// logical sector size.  These layouts must be *rejected* by
+    /// the bootloader's logical sector verification, which the negative
+    /// tests exercise.  Devices unbuildable for other reasons (e.g. an
+    /// unsupported swap algorithm) are still skipped.
+    pub fn each_logical_sector_incompatible_device<F>(f: F)
+        where F: Fn(Self)
+    {
+        for &dev in ALL_DEVICES {
+            for &align in test_alignments() {
+                for &erased_val in &[0, 0xff] {
+                    if Self::device_supports_logical_sectors(dev, align, erased_val) {
+                        continue;
+                    }
                     match Self::new(dev, align, erased_val) {
                         Ok(run) => f(run),
                         Err(msg) => warn!("Skipping {}: {}", dev, msg),
@@ -221,6 +308,17 @@ impl ImagesBuilder {
 
     /// Construct an `Images` that doesn't expect an upgrade to happen.
     pub fn make_no_upgrade_image(self, deps: &DepTest, img_manipulation: ImageManipulation) -> Images {
+        self.make_no_upgrade_image_with_key(deps, img_manipulation, SigningKey::Primary)
+    }
+
+    /// Like `make_no_upgrade_image`, but signs every installed image with the
+    /// given signing key. Used by the multi-key test matrix.
+    pub fn make_no_upgrade_image_with_key(
+        self,
+        deps: &DepTest,
+        img_manipulation: ImageManipulation,
+        signing_key: SigningKey,
+    ) -> Images {
         let num_images = self.num_images();
         let mut flash = self.flash;
         let ram = self.ram.clone();  // TODO: Avoid this clone.
@@ -234,21 +332,21 @@ impl ImagesBuilder {
 
             let (primaries,upgrades) =  if img_manipulation == ImageManipulation::CorruptHigherVersionImage && !higher_version_corrupted {
                 higher_version_corrupted = true;
-                let prim =  install_image(&mut flash, &self.areadesc, &slots, 0,
-                    maximal(42784), &ram, &*dep, ImageManipulation::None, Some(0));
+                let prim =  install_image_with_key(&mut flash, &self.areadesc, &slots, 0,
+                    maximal(42784), &ram, &*dep, ImageManipulation::None, Some(0), signing_key);
                 let upgr   = match deps.depends[image_num] {
                     DepType::NoUpgrade => install_no_image(),
-                    _ => install_image(&mut flash, &self.areadesc, &slots, 1,
-                        maximal(46928), &ram, &*dep, ImageManipulation::BadSignature, Some(1))
+                    _ => install_image_with_key(&mut flash, &self.areadesc, &slots, 1,
+                        maximal(46928), &ram, &*dep, ImageManipulation::BadSignature, Some(1), signing_key)
                 };
                 (prim, upgr)
             } else {
-                let prim = install_image(&mut flash, &self.areadesc, &slots, 0,
-                    maximal(42784), &ram, &*dep, img_manipulation, Some(0));
+                let prim = install_image_with_key(&mut flash, &self.areadesc, &slots, 0,
+                    maximal(42784), &ram, &*dep, img_manipulation, Some(0), signing_key);
                 let upgr = match deps.depends[image_num] {
                         DepType::NoUpgrade => install_no_image(),
-                        _ => install_image(&mut flash, &self.areadesc, &slots, 1,
-                            maximal(46928), &ram, &*dep, img_manipulation, Some(1))
+                        _ => install_image_with_key(&mut flash, &self.areadesc, &slots, 1,
+                            maximal(46928), &ram, &*dep, img_manipulation, Some(1), signing_key)
                     };
                 (prim, upgr)
             };
@@ -313,6 +411,53 @@ impl ImagesBuilder {
             }}).collect();
         Images {
             flash: bad_flash,
+            areadesc: self.areadesc,
+            images,
+            total_count: None,
+            ram: self.ram,
+        }
+    }
+
+    /// Install a valid primary-key-signed image in slot 0 and a secondary
+    /// image signed with `secondary_key` in slot 1. Paired with
+    /// `run_signfail_upgrade` to assert that a build unaware of the secondary
+    /// key correctly refuses to upgrade to it.
+    pub fn make_secondary_slot_image_with_key(self, secondary_key: SigningKey) -> Images {
+        let mut flash = self.flash;
+        let ram = self.ram.clone();
+        let images = self.slots.into_iter().enumerate().map(|(image_num, slots)| {
+            let dep = BoringDep::new(image_num, &NO_DEPS);
+            let primaries = install_image_with_key(
+                &mut flash,
+                &self.areadesc,
+                &slots,
+                0,
+                maximal(32_784),
+                &ram,
+                &dep,
+                ImageManipulation::None,
+                Some(0),
+                SigningKey::Primary,
+            );
+            let upgrades = install_image_with_key(
+                &mut flash,
+                &self.areadesc,
+                &slots,
+                1,
+                maximal(41_928),
+                &ram,
+                &dep,
+                ImageManipulation::None,
+                Some(1),
+                secondary_key,
+            );
+            OneImage {
+                slots,
+                primaries,
+                upgrades,
+            }}).collect();
+        Images {
+            flash,
             areadesc: self.areadesc,
             images,
             total_count: None,
@@ -480,6 +625,36 @@ impl ImagesBuilder {
                 flash.insert(1, dev1);
                 (flash, Rc::new(areadesc), &[Caps::SwapUsingMove, Caps::SwapUsingOffset])
             }
+            DeviceName::Stm32f769 => {
+                // Faithful 2 MiB STM32F769 in dual-bank mode.  The erase pages
+                // within a slot vary in size (16K, 64K, 128K), which the swap
+                // algorithms that assume uniform sectors cannot handle; a 128K
+                // logical sector tiles the layout exactly and makes them work.
+                let dev = SimFlash::new(vec![
+                                        // Bank 1: 0x000000..0x100000
+                                        16 * 1024, 16 * 1024, 16 * 1024, 16 * 1024, 64 * 1024,
+                                        128 * 1024, 128 * 1024, 128 * 1024, 128 * 1024,
+                                        128 * 1024, 128 * 1024, 128 * 1024,
+                                        // Bank 2: 0x100000..0x200000
+                                        16 * 1024, 16 * 1024, 16 * 1024, 16 * 1024, 64 * 1024,
+                                        128 * 1024, 128 * 1024, 128 * 1024, 128 * 1024,
+                                        128 * 1024, 128 * 1024, 128 * 1024],
+                                        align as usize, erased_val);
+                let dev_id = 0;
+                let mut areadesc = AreaDesc::new();
+                areadesc.add_flash_sectors(dev_id, &dev);
+                // Each slot is 4 logical sectors: 16K*4 + 64K makes the first,
+                // then three 128K pages.  Swap-move and swap-offset need one
+                // sector for the trailer and one for padding, so a slot must
+                // hold more than two.
+                areadesc.add_image(0x000000, 0x080000, FlashId::Image0, dev_id);       // primary,   bank 1
+                areadesc.add_image(0x100000, 0x080000, FlashId::Image1, dev_id);       // secondary, bank 2
+                areadesc.add_image(0x080000, 0x020000, FlashId::ImageScratch, dev_id); // scratch,   bank 1
+
+                let mut flash = SimMultiFlash::new();
+                flash.insert(dev_id, dev);
+                (flash, Rc::new(areadesc), &[Caps::SwapUsingMove, Caps::SwapUsingOffset])
+            }
             DeviceName::K64f => {
                 // NXP style flash.  Small sectors, one small sector for scratch.
                 let dev = SimFlash::new(vec![4096; 128], align as usize, erased_val);
@@ -584,6 +759,26 @@ impl ImagesBuilder {
                 areadesc.add_image(0x060000, 0x001000, FlashId::ImageScratch, dev_id);
                 areadesc.add_image(0x080000, 0x020000, FlashId::Image2, dev_id);
                 areadesc.add_image(0x0a0000, 0x020000, FlashId::Image3, dev_id);
+
+                let mut flash = SimMultiFlash::new();
+                flash.insert(dev_id, dev);
+                (flash, Rc::new(areadesc), &[])
+            }
+            DeviceName::SmallPages => {
+                // A device with erase pages much smaller than the logical
+                // sector size.  Each 128K slot spans 256 physical pages,
+                // which exceeds BOOT_MAX_IMG_SECTORS (128), so this device
+                // is only bootable when logical sectors group the pages
+                // into fewer, larger units.  This is the configuration the
+                // logical sector support exists for.
+                let dev = SimFlash::new(vec![512; 1024], align as usize, erased_val);
+
+                let dev_id = 0;
+                let mut areadesc = AreaDesc::new();
+                areadesc.add_flash_sectors(dev_id, &dev);
+                areadesc.add_image(0x020000, 0x020000, FlashId::Image0, dev_id);
+                areadesc.add_image(0x040000, 0x020000, FlashId::Image1, dev_id);
+                areadesc.add_image(0x060000, 0x004000, FlashId::ImageScratch, dev_id);
 
                 let mut flash = SimMultiFlash::new();
                 flash.insert(dev_id, dev);
@@ -955,6 +1150,55 @@ impl Images {
 
         if fails > 0 {
             error!("Expected an upgrade failure and primary slot left untouched");
+        }
+
+        fails > 0
+    }
+
+    /// Boot with an upgrade staged on a device whose reported sector
+    /// layout is incompatible with the configured logical sector size.
+    /// The bootloader's logical sector verification must refuse to touch
+    /// the flash: the boot fails outright (the primary slot's layout
+    /// cannot be trusted), and both slots keep their original contents.
+    pub fn run_incompatible_logical_sectors(&self) -> bool {
+        if !Caps::modifies_flash() {
+            // direct-xip and ram-load don't use sector layouts at all.
+            return false;
+        }
+
+        let mut flash = self.flash.clone();
+        let mut fails = 0;
+
+        info!("Try upgrade with an incompatible logical sector layout");
+
+        self.mark_upgrades(&mut flash, 1);
+
+        // Snapshot every flash device after staging the upgrade; the
+        // rejected boot must leave all of it byte-identical, trailers
+        // included.
+        let snapshot: Vec<(u8, Vec<u8>)> = flash.iter().map(|(&dev_id, dev)| {
+            let mut data = vec![0u8; dev.device_size()];
+            dev.read(0, &mut data).unwrap();
+            (dev_id, data)
+        }).collect();
+
+        if c::boot_go(&mut flash, &self.areadesc, None, None, true).success() {
+            warn!("Boot unexpectedly succeeded with an incompatible layout");
+            fails += 1;
+        }
+
+        for (dev_id, before) in &snapshot {
+            let dev = flash.get(dev_id).unwrap();
+            let mut after = vec![0u8; dev.device_size()];
+            dev.read(0, &mut after).unwrap();
+            if before != &after {
+                warn!("Flash device {} was modified by the rejected boot", dev_id);
+                fails += 1;
+            }
+        }
+
+        if fails > 0 {
+            error!("Expected a rejected boot with the flash untouched");
         }
 
         fails > 0
@@ -1649,17 +1893,27 @@ impl Images {
         let mut rng = rand::rng();
         let mut resets = vec![0i32; count];
         let mut remaining_ops = total_ops;
+        let mut used = 0;
         for reset in &mut resets {
             let reset_counter = rng.random_range(1 ..= remaining_ops / 2);
             let mut counter = reset_counter;
             match c::boot_go(&mut flash, &self.areadesc, Some(&mut counter),
                              None, false) {
                 x if x.interrupted() => (),
+                // An upgrade commits partway through the run: once the image
+                // has been written and the source trailer invalidated, the
+                // remaining operations only tidy up, and a boot from that
+                // state does no flash work at all.  An earlier reset can land
+                // past that point, and then no counter can interrupt this
+                // boot.  Nothing is left to interrupt, so stop resetting.
+                x if x.success() => break,
                 x => panic!("Unknown return: {:?}", x),
             }
             remaining_ops -= reset_counter;
             *reset = reset_counter;
+            used += 1;
         }
+        resets.truncate(used);
 
         match c::boot_go(&mut flash, &self.areadesc, None, None, false) {
             x if x.interrupted() => panic!("Should not be have been interrupted!"),
@@ -1807,6 +2061,17 @@ enum ImageSize {
     Oversized,
 }
 
+/// The sector size the bootloader operates on for `dev`: the logical
+/// sector size when the simulator is built with logical sectors, the
+/// device's physical sector size otherwise.  The physical case assumes
+/// uniform sectors, as does every caller.
+fn boot_sector_size(dev: &dyn Flash) -> usize {
+    match c::logical_sector_size() {
+        0 => dev.sector_iter().next().unwrap().size,
+        size => size,
+    }
+}
+
 /// Estimate the number of bytes in each slot that must be reserved for the trailer when
 /// swap-scratch is used.
 fn estimate_swap_scratch_trailer_size(dev: &dyn Flash, areadesc: &AreaDesc, slot: &SlotInfo) -> usize {
@@ -1825,11 +2090,15 @@ fn estimate_swap_scratch_trailer_size(dev: &dyn Flash, areadesc: &AreaDesc, slot
         _ => panic!("Invalid slot index"),
     };
 
-    let slot_sectors = areadesc.get_area_sectors(flash_id).unwrap();
+    // Sector sizes as seen by the bootloader: uniform logical sectors
+    // when they are enabled, the physical layout otherwise.
+    let slot_sectors: Vec<usize> = match c::logical_sector_size() {
+        0 => areadesc.get_area_sectors(flash_id).unwrap()
+                 .iter().map(|sector| sector.size as usize).collect(),
+        size => vec![size; slot.len / size],
+    };
 
-    for sector in slot_sectors.iter().rev() {
-        let sector_sz = sector.size as usize;
-
+    for &sector_sz in slot_sectors.iter().rev() {
         if sector_sz > trailer_sz_in_fw_sector {
             break;
         }
@@ -1861,7 +2130,7 @@ fn image_largest_trailer(dev: &dyn Flash, areadesc: &AreaDesc, slot: &SlotInfo) 
                 // magic + image-ok + copy-done + swap-info
                 c::boot_magic_sz() + 3 * c::boot_max_align()
             } else if Caps::SwapUsingOffset.present() || Caps::SwapUsingMove.present() {
-                let sector_size = dev.sector_iter().next().unwrap().size as u32;
+                let sector_size = boot_sector_size(dev) as u32;
                 align_up(c::boot_trailer_sz(dev.align() as u32), sector_size) as usize
             } else if Caps::SwapUsingScratch.present() {
                 estimate_swap_scratch_trailer_size(dev, areadesc, slot)
@@ -1879,9 +2148,7 @@ fn required_slot_padding(dev: &dyn Flash) -> usize {
 
     if Caps::SwapUsingMove.present() || Caps::SwapUsingOffset.present() {
         // Assumes equally-sized sectors
-        let sector_size = dev.sector_iter().next().unwrap().size;
-
-        required_padding = sector_size;
+        required_padding = boot_sector_size(dev);
     };
 
     required_padding
@@ -1910,16 +2177,41 @@ fn compute_largest_image_size(dev: &dyn Flash, areadesc: &AreaDesc, slots: &[Slo
 fn install_image(flash: &mut SimMultiFlash, areadesc: &AreaDesc, slots: &[SlotInfo],
                  slot_ind: usize, len: ImageSize, ram: &RamData,
                  deps: &dyn Depender, img_manipulation: ImageManipulation, security_counter:Option<u32>) -> ImageData {
+    install_image_with_key(
+        flash,
+        areadesc,
+        slots,
+        slot_ind,
+        len,
+        ram,
+        deps,
+        img_manipulation,
+        security_counter,
+        SigningKey::Primary,
+    )
+}
+
+fn install_image_with_key(
+    flash: &mut SimMultiFlash,
+    areadesc: &AreaDesc,
+    slots: &[SlotInfo],
+    slot_ind: usize,
+    len: ImageSize,
+    ram: &RamData,
+    deps: &dyn Depender,
+    img_manipulation: ImageManipulation,
+    security_counter: Option<u32>,
+    signing_key: SigningKey,
+) -> ImageData {
     let slot = &slots[slot_ind];
     let mut offset = slot.base_off;
     let dev_id = slot.dev_id;
     let dev = flash.get_mut(&dev_id).unwrap();
 
-    let mut tlv: Box<dyn ManifestGen> = Box::new(make_tlv());
+    let mut tlv: Box<dyn ManifestGen> = Box::new(make_tlv(signing_key));
 
     if Caps::SwapUsingOffset.present() && slot_ind == 1 {
-        let sector_size = dev.sector_iter().next().unwrap().size as usize;
-        offset += sector_size;
+        offset += boot_sector_size(dev);
     }
 
     if img_manipulation == ImageManipulation::IgnoreRamLoadFlag {
@@ -2134,10 +2426,10 @@ fn install_no_image() -> ImageData {
 
 /// Construct a TLV generator based on how MCUboot is currently configured.  The returned
 /// ManifestGen will generate the appropriate entries based on this configuration.
-fn make_tlv() -> TlvGen {
+fn make_tlv(signing_key: SigningKey) -> TlvGen {
     let aes_key_size = if Caps::Aes256.present() { 256 } else { 128 };
 
-    if Caps::EncKw.present() {
+    let tlv = if Caps::EncKw.present() {
         if Caps::RSA2048.present() {
             TlvGen::new_rsa_kw(aes_key_size)
         } else if Caps::EcdsaP256.present() {
@@ -2178,7 +2470,9 @@ fn make_tlv() -> TlvGen {
         } else {
             TlvGen::new_hash_only()
         }
-    }
+    };
+
+    tlv.with_signing_key(signing_key)
 }
 
 impl ImageData {
@@ -2212,7 +2506,7 @@ fn verify_image(flash: &SimMultiFlash, slot: &SlotInfo, images: &ImageData) -> b
     dev.read(offset, &mut copy).unwrap();
 
     if Caps::SwapUsingOffset.present() && (slot.index % 2) == 1 {
-        let sector_size = dev.sector_iter().next().unwrap().size as usize;
+        let sector_size = boot_sector_size(dev);
         let mut copy_offset = vec![0u8; buf.len()];
         let offset_offset = slot.base_off + sector_size;
         dev.read(offset_offset, &mut copy_offset).unwrap();

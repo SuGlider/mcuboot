@@ -43,8 +43,12 @@
 
 #elif defined(MCUBOOT_USE_MBED_TLS)
 
-#include "mbedtls/rsa.h"
-#include "mbedtls/version.h"
+#include "bootutil/crypto/common.h"
+#if MCUBOOT_MBEDTLS_CRYPTO_IN_PRIVATE_SUBDIR
+#include "mbedtls/private/rsa.h"
+#else
+#include <mbedtls/rsa.h>
+#endif
 #if defined(BOOTUTIL_CRYPTO_RSA_CRYPT_ENABLED)
 #if MBEDTLS_VERSION_NUMBER >= 0x03000000
 #include "rsa_alt_helpers.h"
@@ -53,7 +57,6 @@
 #endif
 #endif /* BOOTUTIL_CRYPTO_RSA_CRYPT_ENABLED */
 #include "mbedtls/asn1.h"
-#include "bootutil/crypto/common.h"
 
 #endif /* MCUBOOT_USE_MBED_TLS */
 
@@ -234,12 +237,15 @@ bootutil_rsa_parse_private_key(bootutil_rsa_context *ctx, uint8_t **p, uint8_t *
         return -2;
     }
 
-#if !defined(TF_PSA_CRYPTO_VERSION_NUMBER)
+    int dummy;
+    int* version = &dummy;
     /* version - "ver" field was removed from RSA structure starting from TF-PSA-Crypto. */
-    if (mbedtls_asn1_get_int(p, end, &ctx->MBEDTLS_CONTEXT_MEMBER(ver)) != 0) {
+#if !defined(TF_PSA_CRYPTO_VERSION_NUMBER)
+    version = &ctx->MBEDTLS_CONTEXT_MEMBER(ver);
+#endif /* !TF_PSA_CRYPTO_VERSION_NUMBER */
+    if (mbedtls_asn1_get_int(p, end, version) != 0) {
         return -3;
     }
-#endif /* !TF_PSA_CRYPTO_VERSION_NUMBER */
 
     /* Non-optional fields. */
     if ( /* public modulus */

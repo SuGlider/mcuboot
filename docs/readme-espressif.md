@@ -10,7 +10,7 @@ framework, HAL path and toolchain must be set.
 ---
 ***Note***
 
-*Current compatible ESP-IDF version for HAL sources is `v5.1.6`*
+*Current compatible ESP-IDF version for HAL sources is `v6.0.0`*
 
 ---
 
@@ -21,10 +21,10 @@ Documentation about the MCUboot bootloader design, operation and features can be
 
 The current port is available for use in the following SoCs within the OSes:
 
-|        | ESP32     | ESP32-S2  | ESP32-C3  | ESP32-S3  | ESP32-C2    | ESP32-C6  | ESP32-H2    | ESP32-C5    |
-| :----: | :-------: | :-------: | :-------: | :-------: | :---------: | :-------: | :---------: | :---------: |
-| Zephyr | Supported | Supported | Supported | Supported | Supported   | Supported | Supported   | Supported   |
-| NuttX  | Supported | Supported | Supported | Supported | In progress | Supported | Supported   | ----------- |
+|        | ESP32     | ESP32-S2  | ESP32-C3  | ESP32-S3  | ESP32-C2    | ESP32-C6  | ESP32-H2  | ESP32-C5    | ESP32-C61   | ESP32-P4    |
+| :----: | :-------: | :-------: | :-------: | :-------: | :---------: | :-------: | :-------: | :---------: | :---------: | :---------: |
+| Zephyr | Supported | Supported | Supported | Supported | Supported   | Supported | Supported | Supported   | In progress | In progress |
+| NuttX  | Supported | Supported | Supported | Supported | In progress | Supported | Supported | ----------- | ----------- | ----------- |
 
 Notice that any customization in the memory layout from the OS application must be done aware of
 the bootloader own memory layout to avoid overlapping. More information on the section
@@ -47,7 +47,7 @@ The following instructions considers a MCUboot Espressif port standalone build.
 2. Update the Mbed TLS submodule required by MCUboot:
 
     ```bash
-    git submodule update --init --recursive ext/mbedtls
+    git submodule update --init --recursive ext/mbedtls-3.6.0
     ```
 
 3. If ESP-IDF is the chosen option for use as HAL layer and the system already have ESP-IDF
@@ -158,7 +158,8 @@ Additional configuration related to MCUboot features and slot partitioning may b
     - `MCUBOOT_FLASH_PORT`: "/dev/ttyUSB0"
     - `ESP_BAUD_RATE`: 115200
     - `ESP_FLASH_MODE`: "dio"
-    - `ESP_FLASH_FREQ`: "40m" for ESP32, ESP32-S2, ESP32-S3, ESP32-C3, ESP32-C6, ESP32-C5;
+    - `ESP_FLASH_FREQ`: "40m" for ESP32, ESP32-S2, ESP32-S3, ESP32-C3, ESP32-C6, ESP32-C5, ESP32-C61;
+                        "80m" for ESP32-P4;
                         "60m" for ESP32-C2;
                         "24m" for ESP32-H2.
 
@@ -191,9 +192,9 @@ Additional configuration related to MCUboot features and slot partitioning may b
 
     *`<BOOTLOADER_FLASH_OFFSET>` value must follow one of the addresses below:*
 
-    | ESP32   | ESP32-S2 | ESP32-C3 | ESP32-S3 | ESP32-C2 | ESP32-C6 | ESP32-H2 | ESP32-C5 |
-    | :-----: | :-----:  | :-----:  | :-----:  | :-----:  | :-----:  | :-----:  | :-----:  |
-    | 0x1000  | 0x1000   | 0x0000   | 0x0000   | 0x0000   | 0x0000   | 0x0000   | 0x2000   |
+    | ESP32   | ESP32-S2 | ESP32-C3 | ESP32-S3 | ESP32-C2 | ESP32-C6 | ESP32-H2 | ESP32-C5 | ESP32-C61 | ESP32-P4 |
+    | :-----: | :-----:  | :-----:  | :-----:  | :-----:  | :-----:  | :-----:  | :-----:  | :-------: | :------: |
+    | 0x1000  | 0x1000   | 0x0000   | 0x0000   | 0x0000   | 0x0000   | 0x0000   | 0x2000   | 0x0000    | 0x2000   |
 
     ---
 
@@ -339,7 +340,7 @@ MCUboot header.
 
 The Secure Boot implementation is based on
 [IDF's Secure Boot V2](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/security/secure-boot-v2.html),
-is hardware-assisted and RSA based - except ESP32-C2 that uses ECDSA signing scheme - and has the
+is hardware-assisted and RSA based - except ESP32-C2 and ESP32-C61, which use ECDSA signing scheme - and has the
 role for ensuring that only authorized code will be executed on the device. This is done through
 bootloader signature checking by the ROM bootloader.
 
@@ -356,14 +357,14 @@ CONFIG_SECURE_BOOT_V2_ENABLED=1
 CONFIG_SECURE_SIGNED_ON_BOOT=1
 ```
 
-For the currently supported chips, with exception of ESP32-C2, enable RSA signing scheme:
+For the currently supported chips, with exception of ESP32-C2 and ESP32-C61, enable RSA signing scheme:
 
 ```
 CONFIG_SECURE_SIGNED_APPS_RSA_SCHEME=1
 CONFIG_SECURE_BOOT_SUPPORTS_RSA=1
 ```
 
-For ESP32-C2, enable ECDSA signing scheme and, if working with Flash Encryption too, enable the
+For ESP32-C2 and ESP32-C61, enable ECDSA signing scheme and, if working with Flash Encryption too, enable the
 configuration to burn keys to efuse together:
 
 ```
@@ -876,7 +877,7 @@ Serial mode then uses the UART port configured for communication
 
 ### [Serial Recovery through USB JTAG Serial port](#serial-recovery-through-usb-jtag-serial-port)
 
-Some chips, like ESP32-C3 and ESP32-S3 have an integrated USB JTAG Serial Controller that
+Some chips, like ESP32-C3, ESP32-S3, ESP32-C6, ESP32-C61, and ESP32-P4 have an integrated USB JTAG Serial Controller that
 implements a serial port (CDC) that can also be used for handling MCUboot Serial Recovery.
 More information about the USB pins and hardware configuration:
 
@@ -884,6 +885,9 @@ More information about the USB pins and hardware configuration:
 - ESP32-S3: <https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-guides/usb-serial-jtag-console.html>
 - ESP32-C6: <https://docs.espressif.com/projects/esp-idf/en/latest/esp32c6/api-guides/usb-serial-jtag-console.html>
 - ESP32-H2: <https://docs.espressif.com/projects/esp-idf/en/latest/esp32h2/api-guides/usb-serial-jtag-console.html>
+- ESP32-C5: <https://docs.espressif.com/projects/esp-idf/en/latest/esp32c5/api-guides/usb-serial-jtag-console.html>
+- ESP32-C61: <https://docs.espressif.com/projects/esp-idf/en/latest/esp32c61/api-guides/usb-serial-jtag-console.html>
+- ESP32-P4: <https://docs.espressif.com/projects/esp-idf/en/latest/esp32p4/api-guides/usb-serial-jtag-console.html>
 
 Configuration example:
 
@@ -1427,6 +1431,99 @@ application. `iram_loader_seg` uses `BOOTLOADER_IRAM_LOADER_SEG_START_MP` (0x400
  *  |        |                    |  *** OS CAN RECLAIM IT AFTER BOOT LATER AS HEAP ***
  *  |        v                    |
  *  +--------+--------------+------+ 0x4087FFFF / 0x4087FFFF - HP SRAM END
+```
+
+### ESP32-C61
+
+```
+                                     IRAM ADDR  / DRAM ADDR
+ *  +--------+--------------+------+ 0x40800000 / 0x40800000 - HP SRAM START
+ *  |        ^                    |
+ *  |        |                    |
+ *  |        |                    |
+ *  |        | FREE               |  *CLAIMABLE BY OS RAM
+ *  |        |                    |
+ *  |        |                    |
+ *  |        v                    |
+ *  +--------+--------------+------+ 0x4082CE70 / 0x4082CE70
+ *  |        ^                    |
+ *  |        |                    |
+ *  |        |                    |
+ *  |        | dram_seg           |  *CLAIMABLE BY OS RAM
+ *  |        |                    |  (length 0xB000)
+ *  |        |                    |
+ *  |        v                    |
+ *  +------------------------------+ 0x40837E70 / 0x40837E70
+ *  |        ^                    |
+ *  |        |                    |
+ *  |        |                    |
+ *  |        | iram_seg           |  *CLAIMABLE BY OS RAM (length 0xF000)
+ *  |        |                    |
+ *  |        |                    |
+ *  |        v                    |
+ *  +------------------------------+ 0x40846E70 / 0x40846E70
+ *  |        ^                    |
+ *  |        |                    |  *** SHOULD NOT BE OVERLAPPED ***
+ *  |        | dram_loader_seg    |  *** OS CAN RECLAIM IT AFTER BOOT LATER AS HEAP ***
+ *  |        |                    |  (length 0x1800)
+ *  |        v                    |
+ *  +------------------------------+ 0x40848670 / 0x40848670
+ *  |        ^                    |
+ *  |        |                    |
+ *  |        |                    |
+ *  |        | iram_loader_seg    |  *** SHOULD NOT BE OVERLAPPED ***
+ *  |        |                    |  *** OS CAN RECLAIM IT AFTER BOOT LATER AS HEAP ***
+ *  |        |                    |  (length 0x2400)
+ *  |        v                    |
+ *  +--------+--------------+------+ 0x4084AA70 / 0x4084AA70 - `BOOTLOADER_RAM_END`
+ *  |        ^                    |
+ *  |        | FREE               |  above `BOOTLOADER_RAM_END`
+ *  |        |                    |  *** OS CAN RECLAIM IT AFTER BOOT LATER AS HEAP ***
+ *  |        v                    |
+ *  +--------+--------------+------+ 0x4084FFFF / 0x4084FFFF - HP SRAM END
+```
+
+### ESP32-P4 (rev >= 3.0)
+
+```
+                                     IRAM ADDR  / DRAM ADDR
+ *  +--------+--------------+------+ 0x4FF00000 / 0x4FF00000 - SRAM START
+ *  |        ^                    |
+ *  |        |                    |
+ *  |        | FREE               |  *CLAIMABLE BY OS RAM
+ *  |        |                    |
+ *  |        v                    |
+ *  +--------+--------------+------+ 0x4FF9D3C0 / 0x4FF9D3C0
+ *  |        ^                    |
+ *  |        |                    |
+ *  |        | dram_seg           |  *CLAIMABLE BY OS RAM
+ *  |        |                    |  (length 0xB000)
+ *  |        v                    |
+ *  +------------------------------+ 0x4FFA83C0 / 0x4FFA83C0
+ *  |        ^                    |
+ *  |        |                    |
+ *  |        | iram_seg           |  *CLAIMABLE BY OS RAM (length 0xF000)
+ *  |        |                    |
+ *  |        v                    |
+ *  +------------------------------+ 0x4FFB73C0 / 0x4FFB73C0
+ *  |        ^                    |
+ *  |        |                    |  *** SHOULD NOT BE OVERLAPPED ***
+ *  |        | dram_loader_seg    |  *** OS CAN RECLAIM IT AFTER BOOT LATER AS HEAP ***
+ *  |        |                    |  (length 0x1800)
+ *  |        v                    |
+ *  +------------------------------+ 0x4FFB8BC0 / 0x4FFB8BC0
+ *  |        ^                    |
+ *  |        |                    |
+ *  |        | iram_loader_seg    |  *** SHOULD NOT BE OVERLAPPED ***
+ *  |        |                    |  *** OS CAN RECLAIM IT AFTER BOOT LATER AS HEAP ***
+ *  |        |                    |  (length 0x2400)
+ *  |        v                    |
+ *  +--------+--------------+------+ 0x4FFBAFC0 / 0x4FFBAFC0 - `BOOTLOADER_RAM_END`
+ *  |        ^                    |
+ *  |        | FREE               |  above `BOOTLOADER_RAM_END`
+ *  |        |                    |  *** OS CAN RECLAIM IT AFTER BOOT LATER AS HEAP ***
+ *  |        v                    |
+ *  +--------+--------------+------+ 0x4FFBCFC0 / 0x4FFBCFC0 - ROM bootloader stack region
 ```
 
 ### ESP32-H2
