@@ -3,7 +3,8 @@
 
 # For development, trigger this on any push.
 on:
-  push:
+#  push:
+  workflow_dispatch:
     branches:
       - main
   pull_request:
